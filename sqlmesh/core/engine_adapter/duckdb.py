@@ -28,6 +28,7 @@ if t.TYPE_CHECKING:
 class DuckDBEngineAdapter(LogicalMergeMixin, GetCurrentCatalogFromFunctionMixin, RowDiffMixin):
     DIALECT = "duckdb"
     SUPPORTS_TRANSACTIONS = False
+    SUPPORTS_MINIMUM_CHANGE_TABLE_DIFF = True
     SCHEMA_DIFFER_KWARGS = {
         "parameterized_type_defaults": {
             exp.DataType.build("DECIMAL", dialect=DIALECT).this: [(18, 3), (0,)],

@@ -1106,6 +1106,26 @@ def create_external_models(obj: Context, **kwargs: t.Any) -> None:
     is_flag=True,
     help="If set, when performing a schema diff the case of column names is ignored when matching between the two schemas. For example, 'col_a' in the source schema and 'COL_A' in the target schema will be treated as the same column.",
 )
+@click.option(
+    "--row-match",
+    type=click.Choice(["join", "minimum-change"], case_sensitive=False),
+    default="join",
+    help=(
+        "How rows sharing a business key are matched. 'join' is the default grain join. "
+        "'minimum-change' handles duplicate keys by preserving fully-equal copies and pairing "
+        "the remaining copies so the total number of changed cells is minimized."
+    ),
+)
+@click.option(
+    "--max-unmatched-rows",
+    type=int,
+    default=128,
+    show_default=True,
+    help=(
+        "With --row-match minimum-change, the maximum number of unmatched copies per side of a "
+        "single business key that are paired exactly. Larger two-sided keys abort the diff."
+    ),
+)
 @click.pass_obj
 @error_handler
 @cli_analytics
@@ -1115,6 +1135,8 @@ def table_diff(
     """Show the diff between two tables or a selection of models when they are specified."""
     source, target = source_to_target.split(":")
     select_model = kwargs.pop("select_model", None)
+    # Click keeps the choice literal (hyphenated); the Python API uses the underscore constant.
+    kwargs["row_match"] = kwargs["row_match"].replace("-", "_")
 
     if model and select_model:
         raise SQLMeshError(

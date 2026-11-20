@@ -2062,6 +2062,8 @@ class GenericContext(BaseContext, t.Generic[C]):
         warn_grain_check: bool = False,
         temp_schema: t.Optional[str] = None,
         schema_diff_ignore_case: bool = False,
+        row_match: str = "join",
+        max_unmatched_rows: int = 128,
         **kwargs: t.Any,  # catch-all to prevent an 'unexpected keyword argument' error if an table_diff extension passes in some extra arguments
     ) -> t.List[TableDiff]:
         """Show a diff between two tables.
@@ -2080,6 +2082,13 @@ class GenericContext(BaseContext, t.Generic[C]):
             decimals: The number of decimal places to keep when comparing floating point columns.
             skip_grain_check: Skip check for rows that contain null or duplicate grains.
             temp_schema: The schema to use for temporary tables.
+            row_match: How rows sharing a business key are matched. ``join`` (the default) keeps
+                the historical grain join; ``minimum_change`` pairs duplicate key copies by first
+                preserving all fully-equal copies and then minimizing the total number of changed
+                cells among the remaining copies.
+            max_unmatched_rows: For ``row_match='minimum_change'``, the maximum number of unmatched
+                copies per side within a single business key that will be paired on the host.
+                Keys exceeding this cap while both sides have residuals abort the comparison.
 
         Returns:
             The list of TableDiff objects containing schema and summary differences.
@@ -2187,6 +2196,8 @@ class GenericContext(BaseContext, t.Generic[C]):
                             temp_schema=temp_schema,
                             skip_grain_check=skip_grain_check,
                             schema_diff_ignore_case=schema_diff_ignore_case,
+                            row_match=row_match,
+                            max_unmatched_rows=max_unmatched_rows,
                         ),
                         tasks_num=tasks_num,
                     )
@@ -2213,6 +2224,8 @@ class GenericContext(BaseContext, t.Generic[C]):
                     skip_columns=skip_columns,
                     where=where,
                     schema_diff_ignore_case=schema_diff_ignore_case,
+                    row_match=row_match,
+                    max_unmatched_rows=max_unmatched_rows,
                 )
             ]
 
@@ -2238,6 +2251,8 @@ class GenericContext(BaseContext, t.Generic[C]):
         temp_schema: t.Optional[str] = None,
         skip_grain_check: bool = False,
         schema_diff_ignore_case: bool = False,
+        row_match: str = "join",
+        max_unmatched_rows: int = 128,
     ) -> TableDiff:
         self.console.start_table_diff_model_progress(model.name)
 
@@ -2254,6 +2269,8 @@ class GenericContext(BaseContext, t.Generic[C]):
             source_alias=source_alias,
             target_alias=target_alias,
             schema_diff_ignore_case=schema_diff_ignore_case,
+            row_match=row_match,
+            max_unmatched_rows=max_unmatched_rows,
         )
 
         if show:
@@ -2278,6 +2295,8 @@ class GenericContext(BaseContext, t.Generic[C]):
         skip_columns: t.Optional[t.List[str]] = None,
         where: t.Optional[str | exp.Expr] = None,
         schema_diff_ignore_case: bool = False,
+        row_match: str = "join",
+        max_unmatched_rows: int = 128,
     ) -> TableDiff:
         if not on:
             raise SQLMeshError(
@@ -2298,6 +2317,8 @@ class GenericContext(BaseContext, t.Generic[C]):
             model_name=model.name if model else None,
             model_dialect=model.dialect if model else None,
             schema_diff_ignore_case=schema_diff_ignore_case,
+            row_match=row_match,
+            max_unmatched_rows=max_unmatched_rows,
         )
 
     @python_api_analytics

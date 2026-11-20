@@ -818,6 +818,25 @@ class SQLMeshMagics(Magics):
         action="store_true",
         help="If set, when performing a schema diff the case of column names is ignored when matching between the two schemas. For example, 'col_a' in the source schema and 'COL_A' in the target schema will be treated as the same column.",
     )
+    @argument(
+        "--row-match",
+        type=str,
+        default="join",
+        choices=["join", "minimum-change"],
+        help=(
+            "How rows sharing a business key are matched. 'join' is the default grain join; "
+            "'minimum-change' pairs duplicate key copies while minimizing changed cells."
+        ),
+    )
+    @argument(
+        "--max-unmatched-rows",
+        type=int,
+        default=128,
+        help=(
+            "With --row-match minimum-change, the maximum number of unmatched copies per side "
+            "of a single business key that are paired exactly."
+        ),
+    )
     @line_magic
     @pass_sqlmesh_context
     def table_diff(self, context: Context, line: str) -> None:
@@ -841,6 +860,8 @@ class SQLMeshMagics(Magics):
             skip_grain_check=args.skip_grain_check,
             warn_grain_check=args.warn_grain_check,
             schema_diff_ignore_case=args.schema_diff_ignore_case,
+            row_match=args.row_match.replace("-", "_"),
+            max_unmatched_rows=args.max_unmatched_rows,
         )
 
     @magic_arguments()

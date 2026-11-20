@@ -123,6 +123,96 @@ The default schema for these temporary tables is `sqlmesh_temp` but can be chang
 The schema can be specified as a `CATALOG.SCHEMA` or `SCHEMA`.
 
 
+## Comparing tables with duplicate business keys
+
+The default row matching assumes the grain identifies at most one row on each side. When a
+business key is legitimately non-unique (for example order lines sharing an order id, or event
+streams with repeated keys), an outer join multiplies every source copy by every target copy of
+the same key. The joined row count and every percentage derived from it are then inflated, so
+the result cannot tell you what the migration actually changed.
+
+The `--row-match minimum-change` option (Python: `row_match="minimum_change"`) instead treats
+the grain as a *complete business key* under which several legal rows may exist and matches the
+copies without any cross-join amplification:
+
+1. Every row whose full set of compared column values is identical on both sides is paired
+   first, using the smaller multiplicity of the two equivalence classes.
+2. Among the remaining copies of each key, source and target rows are paired one-to-one so that
+   the **total number of differing non-key cells is minimized**. Copies that cannot be paired
+   because one side runs out are reported as side-only rows.
+
+"Minimum change" is an exact minimum-cost assignment computed independently for every business
+key, not a greedy heuristic and not an attempt to reconstruct row identity that the source
+tables never had. When several pairings share the same minimum cost, SQLMesh chooses the
+lexicographically smallest assignment based on the rows' stable, signature-based ordering, so
+the result does not depend on the physical order in which the database returns rows.
+
+### What counts as equal
+
+Two cells count as equal when they are equal in the engine's normalized comparison semantics:
+
+* integer, boolean and text columns compare on their native values;
+* float and `DECIMAL` columns compare after rounding to the `--decimals` value (default `3`),
+  the same convention used by the default table diff;
+* `DATE` and `TIMESTAMP` columns compare on their normalized calendar/ISO representations;
+* `NULL` matches `NULL`, but an empty string never matches `NULL`;
+* columns excluded with `--skip-columns` participate in neither equality nor the change cost;
+* when there are no comparable non-key columns, all copies sharing a key are treated as equal.
+
+Composite keys are encoded with length-prefixed components rather than a bare concatenation, so
+component boundaries are preserved even when key values contain the delimiter character. Both
+duplicate keys and keys containing `NULL` components are legal; `NULL` matches `NULL` on the
+same key component.
+
+### Reading the statistics and samples
+
+The summary still reads from the same row-diff object, but every count is now expressed in real
+row copies rather than join-expanded rows:
+
+* **FULL MATCH** — copies paired because every compared column was identical;
+* **CHANGED PAIRINGS** — one-to-one pairings of remaining copies with at least one differing
+  cell;
+* **SOURCE ONLY / TARGET ONLY** — copies left unpaired on each side;
+* **TOTAL CHANGED CELLS** — the exact sum of differing non-key cells across the changed
+  pairings.
+
+Each side always satisfies `original rows = full matches + changed pairings + side-only rows`.
+The per-column percentages use the number of real paired copies as the denominator. Sample rows
+carry a **MULTIPLICITY** weight: identical pairings or side-only rows are merged for display and
+the weight states how many real copies the displayed row represents, while the underlying
+statistics always remain unmerged. The sample `--limit` only constrains what is displayed; it
+never changes the matching or the totals.
+
+### Bounding the work: `--max-unmatched-rows`
+
+After the fully-equal copies are removed, only the residual copies of keys that have residuals
+on *both* sides need an exact assignment. The heavy table scans, grouping and full-match
+accounting stay inside the database; only the bounded residuals are transferred to the host.
+Consequently the host-side memory footprint is driven by the largest single key's residuals, the
+sample limit and fixed aggregation buffers — it does not grow with the total number of rows or
+business keys — while the database may use temporary space proportional to the scanned tables.
+Keys with many distinct values (wide equivalence-class fan-out) are more expensive to group and
+pair than keys whose copies are mostly identical, because identical copies are removed before
+any assignment work begins.
+
+`--max-unmatched-rows` (default `128`) caps how many residual copies per side a single business
+key may have. If a two-sided key exceeds the cap, SQLMesh aborts the whole comparison and reports
+the offending key together with its actual source and target residual counts rather than
+returning a partial result that could be mistaken for a complete diff. Keys whose residuals
+exist on only one side have no pairing to solve and are always reported by multiplicity,
+regardless of the cap. Raise the value to allow larger keys, at the cost of more host memory and
+CPU for that key.
+
+```bash
+sqlmesh table_diff src_table:tgt_table -o order_id --row-match minimum-change
+sqlmesh table_diff prod:dev my_model --row-match minimum-change --max-unmatched-rows 256
+```
+
+The same option is available through the Python API on `Context.table_diff` and `TableDiff`.
+The initial implementation supports DuckDB; other engines, unsupported column types or
+mismatched column types raise an explicit error instead of silently falling back to string
+comparison or to the default join behavior.
+
 ## Diffing multiple models across environments
 
 SQLMesh allows you to compare multiple models across environments at once using model selection expressions. This is useful when you want to validate changes across a set of related models or the entire project.

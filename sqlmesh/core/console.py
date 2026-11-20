@@ -2540,7 +2540,11 @@ class TerminalConsole(Console):
         if row_diff.target_alias:
             target_name = row_diff.target_alias.upper()
 
-        if row_diff.stats["null_grain_count"] > 0 or (
+        if row_diff.is_minimum_change:
+            self.console.print(
+                "\n[b][magenta]Row matching: MINIMUM CHANGE (duplicate-aware business key pairing)[/magenta][/b]"
+            )
+        elif row_diff.stats["null_grain_count"] > 0 or (
             not skip_grain_check
             and (
                 row_diff.stats["distinct_count_s"] != row_diff.stats["s_count"]
@@ -2557,8 +2561,9 @@ class TerminalConsole(Console):
                 f" [b][cyan]FULL MATCH[/cyan]:[/b] {row_diff.full_match_count} rows ({row_diff.full_match_pct}%)"
             )
         if row_diff.partial_match_count:
+            label = "CHANGED PAIRINGS" if row_diff.is_minimum_change else "PARTIAL MATCH"
             tree.add(
-                f" [b][blue]PARTIAL MATCH[/blue]:[/b] {row_diff.partial_match_count} rows ({row_diff.partial_match_pct}%)"
+                f" [b][blue]{label}[/blue]:[/b] {row_diff.partial_match_count} rows ({row_diff.partial_match_pct}%)"
             )
         if row_diff.s_only_count:
             tree.add(
@@ -2568,6 +2573,8 @@ class TerminalConsole(Console):
             tree.add(
                 f" [b][green]{target_name} ONLY[/green]:[/b] {row_diff.t_only_count} rows ({row_diff.t_only_pct}%)"
             )
+        if row_diff.is_minimum_change:
+            tree.add(f" [b]TOTAL CHANGED CELLS:[/b] {row_diff.changed_cell_count}")
         self.console.print("\n", tree)
 
         self.console.print("\n[b][blue]COMMON ROWS[/blue] column comparison stats:[/b]")
@@ -2593,10 +2600,26 @@ class TerminalConsole(Console):
                     else ("t__", "TARGET")
                 )
 
+                # Control columns produced by the minimum-change diff are metadata, not data.
+                hidden_columns = {
+                    "__sqlmesh_multiplicity",
+                    "changed_columns",
+                    "__sqlmesh_sample_type",
+                }
+
+                # In minimum-change mode the business keys are shown once as keys; their
+                # side-prefixed copies only appear in the side-only samples and must not be
+                # treated as comparable data columns here.
+                key_column_names = set(keys)
+
                 # Extract key and column names from the joined sample
                 for column in row_diff.joined_sample.columns:
+                    if column in hidden_columns:
+                        continue
                     if source_prefix in column:
                         column_name = "__".join(column.split(source_prefix)[1:])
+                        if column_name in key_column_names:
+                            continue
                         columns[column_name] = [column, target_prefix + column_name]
                     elif target_prefix not in column:
                         keys.append(column)
@@ -2606,9 +2629,32 @@ class TerminalConsole(Console):
                     target_name: self.TABLE_DIFF_TARGET_GREEN,
                 }
 
+                # In minimum-change mode, identical pairings are merged into one weighted row.
+                display_sample = row_diff.joined_sample
+                if (
+                    row_diff.is_minimum_change
+                    and "__sqlmesh_multiplicity" in display_sample.columns
+                ):
+                    weight_col = "__sqlmesh_multiplicity"
+                    group_cols = [
+                        c
+                        for c in display_sample.columns
+                        if c not in (weight_col, "changed_columns")
+                    ]
+                    display_sample = (
+                        display_sample.groupby(group_cols, dropna=False, sort=False)
+                        .agg({weight_col: "sum"})
+                        .reset_index()
+                    )
+                else:
+                    weight_col = None
+
                 for column, [source_column, target_column] in columns.items():
                     # Create a table with the joined keys and comparison columns
-                    column_table = row_diff.joined_sample[keys + [source_column, target_column]]
+                    keep = keys + [source_column, target_column]
+                    if weight_col:
+                        keep.append(weight_col)
+                    column_table = display_sample[keep]
 
                     # Filter to retain non identical-valued rows
                     column_table = column_table[
@@ -2621,6 +2667,12 @@ class TerminalConsole(Console):
                     # Rename the column headers for readability
                     column_table = column_table.rename(
                         columns={
+                            source_column: source_name,
+                            target_column: target_name,
+                            weight_col: "MULTIPLICITY",
+                        }
+                        if weight_col
+                        else {
                             source_column: source_name,
                             target_column: target_name,
                         }
@@ -2654,11 +2706,31 @@ class TerminalConsole(Console):
 
             if row_diff.s_sample.shape[0] > 0:
                 self.console.print(f"\n[b][yellow]{source_name} ONLY[/yellow] sample rows:[/b]")
-                self.console.print(row_diff.s_sample.to_string(index=False), end="\n\n")
+                self.console.print(
+                    self._weighted_side_sample(row_diff.s_sample).to_string(index=False),
+                    end="\n\n",
+                )
 
             if row_diff.t_sample.shape[0] > 0:
                 self.console.print(f"\n[b][green]{target_name} ONLY[/green] sample rows:[/b]")
-                self.console.print(row_diff.t_sample.to_string(index=False), end="\n\n")
+                self.console.print(
+                    self._weighted_side_sample(row_diff.t_sample).to_string(index=False),
+                    end="\n\n",
+                )
+
+    @staticmethod
+    def _weighted_side_sample(sample: "pd.DataFrame") -> "pd.DataFrame":
+        """Collapse identical side-only rows into a single weighted row when applicable."""
+        if "__sqlmesh_multiplicity" not in sample.columns:
+            return sample
+        weight_col = "__sqlmesh_multiplicity"
+        data_cols = [c for c in sample.columns if c not in (weight_col, "changed_columns")]
+        return (
+            sample.groupby(data_cols, dropna=False, sort=False)
+            .agg({weight_col: "sum"})
+            .reset_index()
+            .rename(columns={weight_col: "MULTIPLICITY"})
+        )
 
     def show_table_diff(
         self,

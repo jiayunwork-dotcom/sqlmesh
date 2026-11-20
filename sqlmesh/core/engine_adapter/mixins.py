@@ -473,6 +473,82 @@ class RowDiffMixin(EngineAdapter):
     # Most databases are microsecond (6) but some can only handle millisecond (3) while others go to nanosecond (9)
     MAX_TIMESTAMP_PRECISION = 6
 
+    # Whether the adapter supports the ``row_match="minimum_change"`` TableDiff comparison.
+    # Only adapters that can express every piece of the minimum-change comparison plan
+    # (length-prefixed composite keys, row signatures, null-safe equality and window functions)
+    # should override this to ``True``.
+    SUPPORTS_MINIMUM_CHANGE_TABLE_DIFF = False
+
+    # Data type families that can be compared cell-by-cell by the minimum-change comparison.
+    # Both sides must expose the same column name and the same type for it to participate.
+    MINIMUM_CHANGE_INTEGER_TYPES = tuple(exp.DataType.INTEGER_TYPES)
+    MINIMUM_CHANGE_BOOLEAN_TYPES = (exp.DataType.Type.BOOLEAN,)
+    MINIMUM_CHANGE_REAL_TYPES = tuple(exp.DataType.REAL_TYPES)
+    MINIMUM_CHANGE_STRING_TYPES = (
+        exp.DataType.Type.VARCHAR,
+        exp.DataType.Type.TEXT,
+        exp.DataType.Type.NVARCHAR,
+        exp.DataType.Type.CHAR,
+        exp.DataType.Type.NCHAR,
+    )
+    MINIMUM_CHANGE_TEMPORAL_TYPES = (
+        exp.DataType.Type.DATE,
+        exp.DataType.Type.DATE32,
+        exp.DataType.Type.TIMESTAMP,
+        exp.DataType.Type.TIMESTAMPNTZ,
+        exp.DataType.Type.TIMESTAMPTZ,
+        exp.DataType.Type.TIMESTAMPLTZ,
+        exp.DataType.Type.TIMESTAMP_S,
+        exp.DataType.Type.TIMESTAMP_MS,
+        exp.DataType.Type.TIMESTAMP_NS,
+        exp.DataType.Type.DATETIME,
+    )
+
+    @property
+    def minimum_change_supported_types(self) -> t.Tuple[exp.DataType.Type, ...]:
+        """All data type families supported by the minimum-change table diff."""
+        return (
+            self.MINIMUM_CHANGE_INTEGER_TYPES
+            + self.MINIMUM_CHANGE_BOOLEAN_TYPES
+            + self.MINIMUM_CHANGE_REAL_TYPES
+            + self.MINIMUM_CHANGE_STRING_TYPES
+            + self.MINIMUM_CHANGE_TEMPORAL_TYPES
+        )
+
+    def supports_minimum_change_column_type(self, type_: exp.DataType) -> bool:
+        """Whether a column of the given type can participate in the minimum-change diff."""
+        return type_.is_type(*self.minimum_change_supported_types)
+
+    # A token that cannot be produced by ``normalize_value`` for any real value (normalized
+    # values are always length-prefixed with a leading digit). NULL key/cell components are
+    # encoded with it so that an empty string stays distinguishable from NULL.
+    ROW_DIFF_NULL_TOKEN = "#NULL#"
+
+    def _length_prefixed_token(self, expr: exp.Expr) -> exp.Expr:
+        """Wrap a normalized string expression so component boundaries cannot be lost.
+
+        Every non-NULL component is rendered as ``"<length>:<value>"`` and NULL as a fixed
+        marker, which makes the composite encoding injective regardless of the content of the
+        individual components (delimiters included).
+        """
+        normalized = exp.cast(expr, to=exp.DataType.build("VARCHAR"))
+        length_prefix = exp.cast(exp.func("LENGTH", normalized), to=exp.DataType.build("VARCHAR"))
+        return exp.func(
+            "CONCAT",
+            length_prefix,
+            exp.Literal.string(":"),
+            normalized,
+        )
+
+    def null_safe_key_token(self, expr: exp.Expr, type: exp.DataType) -> exp.Expr:
+        """Encode a single key component into a collision-free, null-aware string token."""
+        normalized = self.normalize_value(expr, type)
+        return (
+            exp.case()
+            .when(expr.is_(exp.Null()), exp.Literal.string(self.ROW_DIFF_NULL_TOKEN))
+            .else_(self._length_prefixed_token(normalized))
+        )
+
     def concat_columns(
         self,
         columns_to_types: t.Dict[str, exp.DataType],
@@ -481,24 +557,78 @@ class RowDiffMixin(EngineAdapter):
         delimiter: str = ",",
     ) -> exp.Expr:
         """
-        Produce an expression that generates a string version of a record, that is:
-            - Every column converted to a string representation, joined together into a single string using the specified :delimiter
+        Produce a collision-free string version of a record.
+
+        Every column is converted to its normalized string representation (see
+        :meth:`normalize_value`) and encoded as a length-prefixed token ``"<length>:<value>"``;
+        NULL components become a fixed :attr:`ROW_DIFF_NULL_TOKEN` marker. The tokens are then
+        joined together using the specified :delimiter.
+
+        The length prefix guarantees that:
+            - component boundaries survive values that themselves contain the delimiter
+            - an empty string ('') never compares equal to NULL
         """
         expressions_to_concat: t.List[exp.Expr] = []
         for idx, (column, type) in enumerate(columns_to_types.items()):
-            expressions_to_concat.append(
-                exp.func(
-                    "COALESCE",
-                    self.normalize_value(
-                        exp.to_column(column), type, decimal_precision, timestamp_precision
-                    ),
-                    exp.Literal.string(""),
-                )
-            )
+            expressions_to_concat.append(self.null_safe_key_token(exp.to_column(column), type))
             if idx < len(columns_to_types) - 1:
                 expressions_to_concat.append(exp.Literal.string(delimiter))
 
         return exp.func("CONCAT", *expressions_to_concat)
+
+    def row_signature(
+        self,
+        columns_to_types: t.Dict[str, exp.DataType],
+        table_alias: str,
+        decimal_precision: int = 3,
+        timestamp_precision: int = MAX_TIMESTAMP_PRECISION,
+    ) -> exp.Expr:
+        """
+        Build a collision-free string fingerprint over the supplied columns of a row.
+
+        Two rows get the same signature if and only if every supplied column is equal under the
+        engine's normalized comparison semantics (including NULL = NULL). The same length-prefixed
+        encoding as :meth:`concat_columns` is used so that empty strings and NULLs, as well as
+        component boundaries in wide rows, cannot collapse distinct rows together.
+        """
+        expressions_to_concat: t.List[exp.Expr] = []
+        for idx, (column, type) in enumerate(columns_to_types.items()):
+            column_expr = exp.column(column, table_alias)
+            normalized = self.normalize_value(
+                column_expr,
+                type,
+                decimal_precision=decimal_precision,
+                timestamp_precision=timestamp_precision,
+            )
+            expressions_to_concat.append(
+                exp.case()
+                .when(column_expr.is_(exp.Null()), exp.Literal.string(self.ROW_DIFF_NULL_TOKEN))
+                .else_(self._length_prefixed_token(normalized))
+            )
+            if idx < len(columns_to_types) - 1:
+                expressions_to_concat.append(exp.Literal.string(","))
+
+        return exp.func("CONCAT", *expressions_to_concat)
+
+    def null_safe_equal(
+        self,
+        left: exp.Expr,
+        right: exp.Expr,
+        type: exp.DataType,
+        decimal_precision: int = 3,
+    ) -> exp.Expr:
+        """
+        Return an expression evaluating to 1 when ``left`` and ``right`` are equal in the
+        engine's normalized comparison semantics, and 0 otherwise. NULL matches NULL and an
+        empty string never matches NULL.
+        """
+        if type.is_type(*exp.DataType.REAL_TYPES):
+            # Keep float/decimal rounding aligned with the decimals used by the rest of table_diff
+            type_params = list(type.find_all(exp.DataTypeParam))
+            if not (len(type_params) == 2 and type_params[-1].this.to_py() == 0):
+                left = self._normalize_decimal_value(left, decimal_precision)
+                right = self._normalize_decimal_value(right, decimal_precision)
+        return exp.case().when(exp.NullSafeEQ(this=left, expression=right), 1).else_(0)
 
     def normalize_value(
         self,
