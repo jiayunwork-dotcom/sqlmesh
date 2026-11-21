@@ -1,0 +1,5 @@
+refund_id,sale_id,customer_id,region,amount
+1,3,2,WEST,10
+2,5,4,EAST,40
+3,9,8,SOUTH,15
+4,7,6,,20

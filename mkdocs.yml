@@ -61,6 +61,7 @@ nav:
     - Metrics:
       - concepts/metrics/overview.md
       - concepts/metrics/definition.md
+      - concepts/metrics/filters.md
     - Architecture:
       - concepts/architecture/snapshots.md
       - concepts/architecture/serialization.md

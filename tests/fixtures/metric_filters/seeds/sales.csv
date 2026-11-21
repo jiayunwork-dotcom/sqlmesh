@@ -1,0 +1,9 @@
+sale_id,customer_id,region,amount
+1,1,EAST,100
+2,1,EAST,200
+3,2,WEST,50
+4,3,WEST,75
+5,4,EAST,300
+6,5,EAST,25
+7,6,NULL,400
+8,,EAST,500

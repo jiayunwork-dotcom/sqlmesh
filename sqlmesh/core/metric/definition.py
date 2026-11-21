@@ -7,6 +7,7 @@ from sqlglot import exp
 from sqlglot.helper import first
 
 from sqlmesh.core import dialect as d
+from sqlmesh.core.metric.filter import Filter, parse_filter
 from sqlmesh.core.node import str_or_exp_to_str
 from sqlmesh.utils import UniqueKeyDict
 from sqlmesh.utils.errors import ConfigError
@@ -73,6 +74,7 @@ class MetricMeta(PydanticModel, frozen=True):
     expression: exp.Expr
     description: t.Optional[str] = None
     owner: t.Optional[str] = None
+    filter: t.Optional[Filter] = None
 
     _path: Path = Path()
 
@@ -94,6 +96,18 @@ class MetricMeta(PydanticModel, frozen=True):
         if isinstance(v, exp.Expr):
             return v
         return v
+
+    @field_validator("filter", mode="before")
+    @classmethod
+    def _validate_filter(cls, v: t.Any, info: ValidationInfo) -> t.Optional[Filter]:
+        if v is None:
+            return None
+        data = validation_data(info)
+        return parse_filter(
+            v,
+            dialect=data.get("dialect") or "",
+            metric_name=data.get("name") or "",
+        )
 
     def to_metric(
         self, metas: t.Dict[str, MetricMeta], metrics: UniqueKeyDict[str, Metric]
@@ -124,6 +138,13 @@ class MetricMeta(PydanticModel, frozen=True):
             )
 
         if metric_refs:
+            if self.filter:
+                _raise_metric_config_error(
+                    f"Filter can only be declared on base metrics. Derived metric '{self.name}' "
+                    "references other metrics and cannot declare a filter",
+                    self._path,
+                )
+
             expanded = self.expression.copy()
             for column in expanded.find_all(exp.Column):
                 metric = metric_refs.get(column)
@@ -133,9 +154,43 @@ class MetricMeta(PydanticModel, frozen=True):
         else:
             expanded = exp.alias_(self.expression, self.name)
 
+        if self.filter:
+            self._validate_filtered_base(expanded)
+
         metric = Metric(**self.dict(), expanded=expanded)
         metric._path = self._path
         return metric
+
+    def _validate_filtered_base(self, expanded: exp.Expr) -> None:
+        """Validate the shape of a base metric that declares a filter.
+
+        Filtered base metrics must be a single ``SUM``, ``COUNT`` or
+        ``COUNT(DISTINCT)`` whose measure is taken from one fact model. The
+        filter itself is validated separately.
+        """
+        aggs = list(expanded.find_all(exp.AggFunc))
+        if len(aggs) != 1:
+            _raise_metric_config_error(
+                f"Filtered metric '{self.name}' must contain exactly one aggregation of SUM, "
+                "COUNT or COUNT(DISTINCT)",
+                self._path,
+            )
+
+        agg = aggs[0]
+        if not isinstance(agg, (exp.Sum, exp.Count)):
+            _raise_metric_config_error(
+                f"Filtered metric '{self.name}' uses unsupported aggregation "
+                f"'{agg.sql(dialect=self.dialect)}'. Only SUM, COUNT and COUNT(DISTINCT) are supported",
+                self._path,
+            )
+
+        measure, dims = _get_measure_and_dim_tables(agg)
+        if dims:
+            _raise_metric_config_error(
+                f"Filtered metric '{self.name}' may only aggregate columns of its single fact "
+                f"model '{measure}'. Population filtering across models belongs in the filter",
+                self._path,
+            )
 
 
 class Metric(MetricMeta, frozen=True):

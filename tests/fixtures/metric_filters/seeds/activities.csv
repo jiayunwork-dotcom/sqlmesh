@@ -1,0 +1,8 @@
+customer_id,kind,status
+1,webinar,attended
+1,promo,attended
+2,promo,invited
+2,webinar,attended
+4,promo,attended
+4,webinar,invited
+,promo,attended

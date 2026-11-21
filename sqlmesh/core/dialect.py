@@ -687,6 +687,9 @@ def _create_parser(expression_type: t.Type[exp.Expr], table_keys: t.List[str]) -
                     value = self.expression(ModelKind(this=kind.value, expressions=props))
             elif key == "expression":
                 value = self._parse_conjunction()
+            elif key == "filter":
+                # A filter may contain OR, so parse the full boolean expression.
+                value = self._parse_expression()
             elif key == "partitioned_by":
                 partitioned_by = self._parse_partitioned_by()
                 if isinstance(partitioned_by.this, exp.Schema):

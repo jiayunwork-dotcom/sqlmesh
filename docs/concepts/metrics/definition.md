@@ -96,3 +96,37 @@ The `METRIC` definition supports the following keys. The `name` and `expression`
 
 ### dialect
 - The dialect that the expression is written in. It is recommended to leave this empty and rely on the project's default dialect.
+
+### filter
+- A boolean SQL expression that determines which fact rows contribute to the metric. The filter is only allowed on **base** metrics (metrics whose expression is a single aggregation over one fact model); derived metrics that reference other metrics cannot declare a filter.
+- Every column in the filter must be fully qualified with its model name, for example `demo.tags.label = 'trial'`.
+- Supported syntax:
+  - column-to-constant comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`)
+  - `IS NULL` / `IS NOT NULL`
+  - boolean combinations with `AND`, `OR`, `NOT` and parentheses
+- Function calls, arithmetic and column-to-column comparisons are not supported.
+- A filter may reference the fact model itself, unique dimensions, and multi-valued related tables (for example tags or activities). Relationships are resolved from the model's `grain` and `references`, including composite join keys.
+- Conditions on one related model are evaluated as a unit against a single related row, so conditions from different rows can never be stitched together. When a related object is missing, it is interpreted as an all-NULL row under SQL three-valued logic; `NULL` join keys never match.
+- The filter only decides eligibility. Multi-valued tables are pre-aggregated to one boolean flag per fact key, so matching rows never multiply the measure. In a group with no eligible rows, `COUNT` returns `0` and `SUM` returns `NULL`.
+
+#### Filter example
+
+```sql
+METRIC (
+  name trial_sales,
+  expression SUM(demo.sales.amount),
+  filter demo.tags.label = 'trial'
+);
+```
+
+A filter combining two multi-valued tables and a same-row predicate:
+
+```sql
+METRIC (
+  name trial_promo_sales,
+  expression SUM(demo.sales.amount),
+  filter demo.tags.label = 'trial'
+    AND demo.activities.kind = 'promo'
+    AND demo.activities.status = 'attended'
+);
+```

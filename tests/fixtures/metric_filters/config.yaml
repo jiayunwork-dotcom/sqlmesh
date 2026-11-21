@@ -1,0 +1,10 @@
+gateways:
+  duckdb:
+    connection:
+      type: duckdb
+      database: metric_filters.duckdb
+
+default_gateway: duckdb
+
+model_defaults:
+  dialect: duckdb
