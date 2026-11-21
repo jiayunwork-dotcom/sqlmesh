@@ -3,6 +3,7 @@ from __future__ import annotations
 import typing as t
 import logging
 
+from collections import defaultdict
 from sqlglot import exp
 
 from sqlmesh.core.engine_adapter import EngineAdapter
@@ -76,11 +77,22 @@ class IntervalState:
             t.Tuple[t.Union[SnapshotIdAndVersionLike, SnapshotIntervals], Interval]
         ] = snapshot_intervals
         if remove_shared_versions:
-            name_version_mapping = {s.name_version: interval for s, interval in snapshot_intervals}
+            # Every (snapshot, interval) pair in the batch counts. Multiple pairs may target
+            # the same (name, version) - for example logically distinct snapshots that point
+            # at the same production table - so group all intervals by name/version instead
+            # of keeping only the last interval seen for each name/version.
+            intervals_per_name_version: t.Dict[SnapshotNameVersion, t.List[Interval]] = defaultdict(
+                list
+            )
+            for s, interval in snapshot_intervals:
+                intervals = intervals_per_name_version[s.name_version]
+                if interval not in intervals:
+                    intervals.append(interval)
+
             all_snapshots = []
             for where in snapshot_name_version_filter(
                 self.engine_adapter,
-                name_version_mapping,
+                intervals_per_name_version,
                 alias=None,
                 batch_size=self.SNAPSHOT_BATCH_SIZE,
             ):
@@ -103,9 +115,13 @@ class IntervalState:
                         )
                     ]
                 )
+            # Each interval recorded against a name/version is removed for every snapshot
+            # that shares it, so that the shared production completion range reflects all
+            # the revocations in the batch regardless of their order.
             intervals_to_remove = [
-                (snapshot, name_version_mapping[snapshot.name_version])
+                (snapshot, interval)
                 for snapshot in all_snapshots
+                for interval in intervals_per_name_version[snapshot.name_version]
             ]
 
         if not intervals_to_remove:
@@ -115,6 +131,9 @@ class IntervalState:
             snapshot_ids = ", ".join(str(s.snapshot_id) for s, _ in intervals_to_remove)
             logger.info("Removing interval for snapshots: %s", snapshot_ids)
 
+        # The whole batch is written with a single insert so that a failure cannot leave
+        # a partially applied batch behind. On engines with transaction support the
+        # state sync wraps this call in a transaction as well.
         self.engine_adapter.insert_append(
             self.intervals_table,
             _intervals_to_df(intervals_to_remove, is_dev=False, is_removed=True),

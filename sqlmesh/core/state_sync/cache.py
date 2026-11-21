@@ -124,7 +124,10 @@ class CachingStateSync(DelegatingStateSync):
     def add_snapshots_intervals(self, snapshots_intervals: t.Sequence[SnapshotIntervals]) -> None:
         for snapshot_intervals in snapshots_intervals:
             if snapshot_intervals.snapshot_id:
-                self.snapshot_cache.pop(snapshot_intervals.snapshot_id, None)
+                # Interval records are hydrated into every snapshot that shares the same
+                # name and version, so all of their cached entries become stale, not just
+                # the one the intervals were recorded against.
+                self._evict_by_name_version(snapshot_intervals.name, snapshot_intervals.version)
             else:
                 # Evict all snapshots that share the same name
                 self.snapshot_cache = {
@@ -139,9 +142,25 @@ class CachingStateSync(DelegatingStateSync):
         snapshot_intervals: t.Sequence[t.Tuple[SnapshotIdAndVersionLike, Interval]],
         remove_shared_versions: bool = False,
     ) -> None:
-        for s, _ in snapshot_intervals:
-            self.snapshot_cache.pop(s.snapshot_id, None)
+        # Evict before delegating so that a failed removal doesn't leave stale entries
+        # behind and a subsequent retry starts from a cold read.
+        if remove_shared_versions:
+            # The removal is fanned out to every snapshot that shares a targeted
+            # (name, version), so the cached entries of all such snapshots become stale,
+            # including snapshots that are not part of the request itself.
+            for s, _ in snapshot_intervals:
+                self._evict_by_name_version(s.name, s.version)
+        else:
+            for s, _ in snapshot_intervals:
+                self.snapshot_cache.pop(s.snapshot_id, None)
         self.state_sync.remove_intervals(snapshot_intervals, remove_shared_versions)
+
+    def _evict_by_name_version(self, name: str, version: t.Optional[str]) -> None:
+        self.snapshot_cache = {
+            snapshot_id: cached
+            for snapshot_id, cached in self.snapshot_cache.items()
+            if not cached[0] or (cached[0].name, cached[0].version) != (name, version)
+        }
 
     def unpause_snapshots(
         self, snapshots: t.Collection[SnapshotInfoLike], unpaused_dt: TimeLike

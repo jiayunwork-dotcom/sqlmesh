@@ -241,6 +241,32 @@ def get_snapshot_intervals(state_sync) -> t.Callable[[Snapshot], t.Optional[Snap
     return _get_snapshot_intervals
 
 
+def _make_shared_version_snapshot(
+    make_snapshot: t.Callable,
+    query: str,
+    version: str = "v1",
+    name: str = "m",
+    dev_version: t.Optional[str] = None,
+) -> Snapshot:
+    """Creates a snapshot of a daily model, allowing several logically distinct snapshots
+    (different identifiers) to share the same production name/version."""
+    snapshot = make_snapshot(
+        SqlModel(
+            name=name,
+            cron="@daily",
+            query=parse_one(query),
+        ),
+        version=version,
+    )
+    if dev_version is not None:
+        snapshot.dev_version_ = dev_version
+    return snapshot
+
+
+def _jan(day: int) -> int:
+    return to_timestamp(f"2024-01-{day:02d}")
+
+
 def test_add_interval(
     state_sync: EngineAdapterStateSync,
     make_snapshot: t.Callable,
@@ -432,6 +458,428 @@ def test_remove_interval_empty_input(state_sync: EngineAdapterStateSync) -> None
     state_sync.remove_intervals([], remove_shared_versions=True)
 
     assert state_sync.engine_adapter.fetchone("SELECT COUNT(*) FROM sqlmesh._intervals")[0] == 0  # type: ignore
+
+
+def test_remove_intervals_shared_version_batch_all_entries_count(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable
+) -> None:
+    # Two logically distinct snapshots point at the same production table (same name and
+    # version, different identifiers). Every interval in the removal batch must count for
+    # every snapshot sharing the version.
+    snapshot_a = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    snapshot_b = _make_shared_version_snapshot(make_snapshot, "select 2, ds")
+    assert snapshot_a.snapshot_id != snapshot_b.snapshot_id
+    assert snapshot_a.name_version == snapshot_b.name_version
+
+    state_sync.push_snapshots([snapshot_a, snapshot_b])
+    state_sync.add_interval(snapshot_a, "2024-01-01", "2024-01-10")
+    state_sync.add_interval(snapshot_b, "2024-01-01", "2024-01-10")
+
+    state_sync.remove_intervals(
+        [
+            (snapshot_a, snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02")),
+            (snapshot_b, snapshot_b.inclusive_exclusive("2024-01-07", "2024-01-07")),
+        ],
+        remove_shared_versions=True,
+    )
+
+    expected_intervals = [
+        (_jan(1), _jan(2)),
+        (_jan(3), _jan(7)),
+        (_jan(8), _jan(11)),
+    ]
+    expected_missing = [(_jan(2), _jan(3)), (_jan(7), _jan(8))]
+
+    snapshots = state_sync.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert snapshots[snapshot_id].intervals == expected_intervals
+        assert (
+            snapshots[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == expected_missing
+        )
+
+
+def test_remove_intervals_shared_version_batch_overlap_duplicates_and_order(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable, tmp_path
+) -> None:
+    snapshot_a = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    snapshot_b = _make_shared_version_snapshot(make_snapshot, "select 2, ds")
+    state_sync.push_snapshots([snapshot_a, snapshot_b])
+    state_sync.add_interval(snapshot_a, "2024-01-01", "2024-01-10")
+    state_sync.add_interval(snapshot_b, "2024-01-01", "2024-01-10")
+
+    jan2 = snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02")
+    jan3_to_5 = snapshot_a.inclusive_exclusive("2024-01-03", "2024-01-04")
+    jan4_to_6 = snapshot_a.inclusive_exclusive("2024-01-04", "2024-01-05")
+    jan7 = snapshot_b.inclusive_exclusive("2024-01-07", "2024-01-07")
+
+    # The same snapshot appears multiple times, intervals overlap or are adjacent, and a
+    # duplicate entry must not swallow the other removals.
+    state_sync.remove_intervals(
+        [
+            (snapshot_a, jan2),
+            (snapshot_a, jan3_to_5),
+            (snapshot_a, jan4_to_6),
+            (snapshot_b, jan7),
+            (snapshot_b, jan7),
+        ],
+        remove_shared_versions=True,
+    )
+
+    expected_intervals = [
+        (_jan(1), _jan(2)),
+        (_jan(6), _jan(7)),
+        (_jan(8), _jan(11)),
+    ]
+    snapshots = state_sync.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert snapshots[snapshot_id].intervals == expected_intervals
+
+    # 2 snapshots x 4 distinct intervals; the duplicate entry is recorded only once.
+    remove_records_count = state_sync.engine_adapter.fetchone(
+        "SELECT COUNT(*) FROM sqlmesh._intervals WHERE is_removed"
+    )[0]  # type: ignore
+    assert remove_records_count == 8
+
+    # The same batch applied in reverse order to a fresh state store must converge to the
+    # same final completion range.
+    other_conn = duckdb.connect()
+    other_state_sync = EngineAdapterStateSync(
+        create_engine_adapter(lambda: other_conn, "duckdb"),
+        schema=c.SQLMESH,
+        cache_dir=tmp_path / "other_cache",
+    )
+    other_state_sync.migrate()
+    other_state_sync.push_snapshots([snapshot_a, snapshot_b])
+    other_state_sync.add_interval(snapshot_a, "2024-01-01", "2024-01-10")
+    other_state_sync.add_interval(snapshot_b, "2024-01-01", "2024-01-10")
+    other_state_sync.remove_intervals(
+        [
+            (snapshot_b, jan7),
+            (snapshot_b, jan7),
+            (snapshot_a, jan4_to_6),
+            (snapshot_a, jan3_to_5),
+            (snapshot_a, jan2),
+        ],
+        remove_shared_versions=True,
+    )
+    other_snapshots = other_state_sync.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert other_snapshots[snapshot_id].intervals == expected_intervals
+
+
+def test_remove_intervals_local_batch_all_entries_count(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable
+) -> None:
+    # With remove_shared_versions=False the removal stays local to the given snapshot,
+    # but every entry in the batch still counts.
+    snapshot = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    state_sync.push_snapshots([snapshot])
+    state_sync.add_interval(snapshot, "2024-01-01", "2024-01-10")
+
+    state_sync.remove_intervals(
+        [
+            (snapshot, snapshot.inclusive_exclusive("2024-01-02", "2024-01-02")),
+            (snapshot, snapshot.inclusive_exclusive("2024-01-07", "2024-01-07")),
+        ],
+        remove_shared_versions=False,
+    )
+
+    assert state_sync.get_snapshots([snapshot])[snapshot.snapshot_id].intervals == [
+        (_jan(1), _jan(2)),
+        (_jan(3), _jan(7)),
+        (_jan(8), _jan(11)),
+    ]
+
+
+def test_remove_intervals_shared_version_isolation(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable
+) -> None:
+    snapshot_a = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    snapshot_b = _make_shared_version_snapshot(make_snapshot, "select 2, ds")
+    # Same name and version but a different dev version.
+    snapshot_dev = _make_shared_version_snapshot(make_snapshot, "select 3, ds", dev_version="m_dev")
+    # Same name but a different production version.
+    snapshot_v2 = _make_shared_version_snapshot(make_snapshot, "select 4, ds", version="v2")
+    # A different model altogether.
+    snapshot_other = _make_shared_version_snapshot(make_snapshot, "select 5, ds", name="other")
+
+    all_snapshots = [snapshot_a, snapshot_b, snapshot_dev, snapshot_v2, snapshot_other]
+    state_sync.push_snapshots(all_snapshots)
+    for snapshot in all_snapshots:
+        state_sync.add_interval(snapshot, "2024-01-01", "2024-01-10")
+
+    # A dev interval for snapshot_a which must survive the production removal.
+    snapshot_a.change_category = SnapshotChangeCategory.BREAKING
+    snapshot_a.forward_only = True
+    state_sync.add_interval(snapshot_a, "2024-01-01", "2024-01-10", is_dev=True)
+
+    state_sync.remove_intervals(
+        [(snapshot_a, snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02"))],
+        remove_shared_versions=True,
+    )
+
+    expected_intervals = [(_jan(1), _jan(2)), (_jan(3), _jan(11))]
+    full_intervals = [(_jan(1), _jan(11))]
+
+    snapshots = state_sync.get_snapshots(all_snapshots)
+    # The production completion range is shared by (name, version), regardless of the
+    # identifier or the dev version.
+    for snapshot_id in (
+        snapshot_a.snapshot_id,
+        snapshot_b.snapshot_id,
+        snapshot_dev.snapshot_id,
+    ):
+        assert snapshots[snapshot_id].intervals == expected_intervals
+    # The other production version of the same model and the other model are untouched.
+    assert snapshots[snapshot_v2.snapshot_id].intervals == full_intervals
+    assert snapshots[snapshot_other.snapshot_id].intervals == full_intervals
+    # Dev intervals are tracked by dev version and are not affected by production removals.
+    assert snapshots[snapshot_a.snapshot_id].dev_intervals == full_intervals
+
+
+def test_caching_state_sync_remove_intervals_shared_versions(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable
+) -> None:
+    snapshot_a = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    snapshot_b = _make_shared_version_snapshot(make_snapshot, "select 2, ds")
+    snapshot_v2 = _make_shared_version_snapshot(make_snapshot, "select 3, ds", version="v2")
+
+    all_snapshots = [snapshot_a, snapshot_b, snapshot_v2]
+    state_sync.push_snapshots(all_snapshots)
+    for snapshot in all_snapshots:
+        state_sync.add_interval(snapshot, "2024-01-01", "2024-01-10")
+
+    cache = CachingStateSync(state_sync, ttl=3600)
+
+    # Prime the cache.
+    warm = cache.get_snapshots(all_snapshots)
+    assert not warm[snapshot_b.snapshot_id].missing_intervals("2024-01-01", "2024-01-10")
+
+    # Revoke a day through snapshot A only.
+    cache.remove_intervals(
+        [(snapshot_a, snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02"))],
+        remove_shared_versions=True,
+    )
+
+    # Every cached snapshot sharing the name/version is evicted, including snapshot B
+    # which was not part of the request; the other production version stays cached.
+    assert snapshot_a.snapshot_id not in cache.snapshot_cache
+    assert snapshot_b.snapshot_id not in cache.snapshot_cache
+    assert snapshot_v2.snapshot_id in cache.snapshot_cache
+
+    expected_missing = [(_jan(2), _jan(3))]
+    hot = cache.get_snapshots(all_snapshots)
+    assert (
+        hot[snapshot_a.snapshot_id].missing_intervals("2024-01-01", "2024-01-10")
+        == expected_missing
+    )
+    assert (
+        hot[snapshot_b.snapshot_id].missing_intervals("2024-01-01", "2024-01-10")
+        == expected_missing
+    )
+    assert not hot[snapshot_v2.snapshot_id].missing_intervals("2024-01-01", "2024-01-10")
+
+    # The hot reads must agree with cold reads.
+    cold = state_sync.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert hot[snapshot_id].intervals == cold[snapshot_id].intervals
+
+
+def test_caching_state_sync_partial_backfill_after_removal(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable
+) -> None:
+    snapshot_a = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    snapshot_b = _make_shared_version_snapshot(make_snapshot, "select 2, ds")
+    state_sync.push_snapshots([snapshot_a, snapshot_b])
+    state_sync.add_interval(snapshot_a, "2024-01-01", "2024-01-10")
+    state_sync.add_interval(snapshot_b, "2024-01-01", "2024-01-10")
+
+    cache = CachingStateSync(state_sync, ttl=3600)
+    cache.get_snapshots([snapshot_a, snapshot_b])
+
+    cache.remove_intervals(
+        [
+            (snapshot_a, snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02")),
+            (snapshot_b, snapshot_b.inclusive_exclusive("2024-01-07", "2024-01-07")),
+        ],
+        remove_shared_versions=True,
+    )
+
+    # Re-prime so both snapshots are cached with the gaps.
+    hot = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert hot[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == [
+            (_jan(2), _jan(3)),
+            (_jan(7), _jan(8)),
+        ]
+
+    # Backfill only 2024-01-02 through snapshot A; the shared completion range means
+    # snapshot B's cached view must reflect it too.
+    cache.add_interval(snapshot_a, "2024-01-02", "2024-01-02")
+
+    hot = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert hot[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == [
+            (_jan(7), _jan(8))
+        ]
+
+
+def test_remove_intervals_write_failure_rolls_back(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable, mocker: MockerFixture
+) -> None:
+    snapshot_a = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    snapshot_b = _make_shared_version_snapshot(make_snapshot, "select 2, ds")
+    state_sync.push_snapshots([snapshot_a, snapshot_b])
+    state_sync.add_interval(snapshot_a, "2024-01-01", "2024-01-10")
+    state_sync.add_interval(snapshot_b, "2024-01-01", "2024-01-10")
+
+    cache = CachingStateSync(state_sync, ttl=3600)
+    cache.get_snapshots([snapshot_a, snapshot_b])
+
+    batch = [
+        (snapshot_a, snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02")),
+        (snapshot_b, snapshot_b.inclusive_exclusive("2024-01-07", "2024-01-07")),
+    ]
+    full_intervals = [(_jan(1), _jan(11))]
+
+    failing_insert = mocker.patch.object(
+        state_sync.engine_adapter,
+        "insert_append",
+        side_effect=SQLMeshError("injected write failure"),
+    )
+    with pytest.raises(SQLMeshError, match="injected write failure"):
+        cache.remove_intervals(batch, remove_shared_versions=True)
+    # The whole batch is written with a single atomic insert.
+    assert failing_insert.call_count == 1
+
+    # Nothing from the failed batch may be left behind.
+    assert (
+        state_sync.engine_adapter.fetchone(
+            "SELECT COUNT(*) FROM sqlmesh._intervals WHERE is_removed"
+        )[0]
+        == 0
+    )  # type: ignore
+    cold = state_sync.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert cold[snapshot_id].intervals == full_intervals
+
+    # The cache must not present the failed removal as applied.
+    hot = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert hot[snapshot_id].intervals == full_intervals
+
+    # Retrying after the failure goes through and is fully visible.
+    mocker.stopall()
+    cache.remove_intervals(batch, remove_shared_versions=True)
+    expected_missing = [(_jan(2), _jan(3)), (_jan(7), _jan(8))]
+    retried = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert (
+            retried[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == expected_missing
+        )
+
+
+def test_remove_intervals_compact_reopen_and_partial_backfill(
+    tmp_path, make_snapshot: t.Callable
+) -> None:
+    db_path = tmp_path / "state.db"
+    connections = []
+
+    def _open_state_sync() -> EngineAdapterStateSync:
+        conn = duckdb.connect(str(db_path))
+        connections.append(conn)
+        return EngineAdapterStateSync(
+            create_engine_adapter(lambda: conn, "duckdb"),
+            schema=c.SQLMESH,
+            cache_dir=tmp_path / c.CACHE,
+        )
+
+    state_sync = _open_state_sync()
+    state_sync.migrate()
+
+    snapshot_a = _make_shared_version_snapshot(make_snapshot, "select 1, ds")
+    snapshot_b = _make_shared_version_snapshot(make_snapshot, "select 2, ds")
+    snapshot_v2 = _make_shared_version_snapshot(make_snapshot, "select 3, ds", version="v2")
+    snapshot_other = _make_shared_version_snapshot(make_snapshot, "select 4, ds", name="other")
+
+    all_snapshots = [snapshot_a, snapshot_b, snapshot_v2, snapshot_other]
+    state_sync.push_snapshots(all_snapshots)
+    for snapshot in all_snapshots:
+        state_sync.add_interval(snapshot, "2024-01-01", "2024-01-10")
+
+    cache = CachingStateSync(state_sync, ttl=3600)
+
+    # Prime the cache.
+    warm = cache.get_snapshots([snapshot_a, snapshot_b])
+    assert not warm[snapshot_a.snapshot_id].missing_intervals("2024-01-01", "2024-01-10")
+
+    # Revoke two days, one through each snapshot of the shared version.
+    cache.remove_intervals(
+        [
+            (snapshot_a, snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02")),
+            (snapshot_b, snapshot_b.inclusive_exclusive("2024-01-07", "2024-01-07")),
+        ],
+        remove_shared_versions=True,
+    )
+
+    expected_missing = [(_jan(2), _jan(3)), (_jan(7), _jan(8))]
+
+    # Read back and compute the gaps.
+    hot = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert hot[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == expected_missing
+
+    # The gaps must survive interval compaction.
+    state_sync.compact_intervals()
+    compacted = state_sync.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert (
+            compacted[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == expected_missing
+        )
+
+    # ... and closing and reopening the state store.
+    connections.pop().close()
+    state_sync = _open_state_sync()
+    cache = CachingStateSync(state_sync, ttl=3600)
+    reopened = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert (
+            reopened[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == expected_missing
+        )
+
+    # Repeating the same revocation is idempotent and cannot resurrect the gaps.
+    cache.remove_intervals(
+        [
+            (snapshot_a, snapshot_a.inclusive_exclusive("2024-01-02", "2024-01-02")),
+            (snapshot_b, snapshot_b.inclusive_exclusive("2024-01-07", "2024-01-07")),
+        ],
+        remove_shared_versions=True,
+    )
+    reread = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert reread[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == expected_missing
+
+    # Backfilling one of the revoked days clears exactly that gap.
+    cache.add_interval(snapshot_a, "2024-01-02", "2024-01-02")
+    after_backfill = cache.get_snapshots([snapshot_a, snapshot_b])
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert after_backfill[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == [
+            (_jan(7), _jan(8))
+        ]
+
+    # Compaction and reopening once more preserve exactly the remaining gap, while the
+    # other version of the same model and the other model stay complete throughout.
+    state_sync.compact_intervals()
+    connections.pop().close()
+    state_sync = _open_state_sync()
+    final = state_sync.get_snapshots(all_snapshots)
+    for snapshot_id in (snapshot_a.snapshot_id, snapshot_b.snapshot_id):
+        assert final[snapshot_id].missing_intervals("2024-01-01", "2024-01-10") == [
+            (_jan(7), _jan(8))
+        ]
+    assert not final[snapshot_v2.snapshot_id].missing_intervals("2024-01-01", "2024-01-10")
+    assert not final[snapshot_other.snapshot_id].missing_intervals("2024-01-01", "2024-01-10")
+    connections.pop().close()
 
 
 def test_refresh_snapshot_intervals(
